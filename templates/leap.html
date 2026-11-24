@@ -2,18 +2,131 @@
 {% block title %}闰秒表 · 曝光台账{% endblock %}
 {% block content %}
 <section class="panel">
+  <h2>独立计时器核定闰秒表</h2>
+  <p class="hint">
+    巡天组凭独立计时器的脉冲间隔读数核定闰秒表：填写最多 120 个待查日期和最多 500 条脉冲间隔，
+    每条间隔给出先后两个 UTC 时刻与实测整数秒数（支持闰秒日 <code>23:59:60</code>）。
+    只允许在待查日期上增删正闰秒，其余日期沿用现行表。
+  </p>
+  <p class="hint">
+    间隔每行三列：<code>开始时刻,结束时刻,实测秒数</code>（逗号/分号/Tab 分隔，可带一行表头）。
+    候选表必须同时复现全部间隔，且库中用 UTC 文本记录的闰秒起点在启用时仍然有效。
+    <a href="{{ url_for('interval_template_csv') }}">下载间隔示例 CSV</a>
+  </p>
+  <form method="post" class="stack">
+    <input type="hidden" name="action" value="adjudicate">
+    <label for="candidate_text">待查日期（一行一个 YYYY-MM-DD，≤120 个）</label>
+    <textarea id="candidate_text" name="candidate_text" rows="6"
+      placeholder="2020-12-31&#10;2021-06-30">{{ form_candidates }}</textarea>
+    <label for="interval_text">脉冲间隔（开始时刻,结束时刻,实测整数秒数，≤500 条）</label>
+    <textarea id="interval_text" name="interval_text" rows="8"
+      placeholder="2020-12-31 00:00:00,2021-01-01 00:00:00,86401">{{ form_intervals }}</textarea>
+    <div>
+      <button type="submit">核定候选表</button>
+    </div>
+  </form>
+
+  {% if verify_error %}
+  <div class="failure">
+    <h3>核定输入未通过校验，未产生候选表</h3>
+    <p>{{ verify_error }}</p>
+  </div>
+  {% endif %}
+
+  {% if verification %}
+  <div class="{{ 'failure' if verification.status == 'no_solution' else ('warnbox' if verification.status == 'multiple' else 'success') }}">
+    <h3>
+      核定结果（记录 #{{ verify_run_id }}，基于现行表 v{{ stats.leap_version }}）：
+      {% if verification.status == 'no_solution' %}无解
+      {% elif verification.status == 'multiple' %}多解
+      {% else %}唯一解{% endif %}
+    </h3>
+    <p class="hint">
+      共 {{ verification.candidates|length }} 个待查日期、{{ verification.intervals|length }} 条脉冲间隔；
+      沿用现行表闰秒日 {{ verification.fixed_leap_dates|length }} 个。
+    </p>
+
+    {% if verification.status == 'no_solution' %}
+    <p>没有任何候选表能同时复现全部间隔：</p>
+    <ul class="errors">
+      {% for item in verification.contradictions %}<li>{{ item }}</li>{% endfor %}
+    </ul>
+    {% endif %}
+
+    {% if verification.status == 'multiple' %}
+    <p>存在多张候选表都能复现全部间隔。以下日期仍不能确定有无闰秒：</p>
+    <p>
+      {% for day in verification.undetermined %}<code>{{ day.isoformat() }}</code>{% if not loop.last %}，{% endif %}{% endfor %}
+    </p>
+    {% endif %}
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>待查日期</th><th>结论</th></tr></thead>
+        <tbody>
+          {% for v in verification.verdicts %}
+          <tr>
+            <td><code>{{ v.day.isoformat() }}</code></td>
+            <td>
+              {% if v.determined %}
+                {% if v.value == 1 %}<span class="leap-yes">确定为正闰秒日（86401 秒）</span>
+                {% else %}<span class="leap-no">确定为普通日（86400 秒）</span>{% endif %}
+              {% else %}
+                <span class="leap-unknown">不能确定（有闰秒/无闰秒均可行）</span>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    {% if verification.status == 'unique' %}
+    <p class="hint">唯一候选表（{{ verification.candidate_table.dates|length }} 个闰秒日）内容：</p>
+    <pre class="table-text">{{ verification.candidate_table | leap_table_text }}</pre>
+    <form method="post" class="stack">
+      <input type="hidden" name="action" value="confirm">
+      <input type="hidden" name="run_id" value="{{ verify_run_id }}">
+      <input type="hidden" name="candidate_text" value="{{ form_candidates }}">
+      <input type="hidden" name="interval_text" value="{{ form_intervals }}">
+      <p class="hint">
+        确认时将按最新已提交的曝光和闰秒表重新复核；结果仍唯一且与本次核定完全相同才会启用，
+        否则继续使用当时的生效表。初次核定期间可继续导入曝光或手工换表。
+      </p>
+      <div><button type="submit">按最新数据复核并确认启用</button></div>
+    </form>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  {% if confirm_message %}
+  <div class="{{ 'success' if confirm_ok else 'failure' }}">
+    <h3>确认启用{% if confirm_ok %}成功{% else %}未执行{% endif %}</h3>
+    <p>{{ confirm_message }}</p>
+    {% if confirm_ok and confirm_outcome %}
+    <p>
+      生效版本 v{{ confirm_outcome.active_version }}（上一版 v{{ confirm_outcome.previous_version }}），
+      重算 {{ confirm_outcome.updated_text_rows }} 条 UTC 文本曝光，共 {{ confirm_outcome.leap_days }} 个闰秒日。
+    </p>
+    {% endif %}
+  </div>
+  {% endif %}
+</section>
+
+<section class="panel">
   <h2>生效中的正闰秒日期表 <span class="tag">v{{ version }}</span></h2>
   <p class="hint">
     一行一个 <code>YYYY-MM-DD</code>，表示该 UTC 日在 23:59:59 之后插入一秒 23:59:60。<code>#</code> 起为注释。
-    换表按提交内容整批校验；若新表会让已入库的 UTC 文本失效，将列出相关曝光号并保留原表。
+    手工换表按提交内容整批校验；若新表会让已入库的 UTC 文本失效，将列出相关曝光号并保留原表。
   </p>
   <p class="hint">共 {{ table.dates|length }} 个闰秒日，时区固定 UTC。</p>
   <pre class="table-text">{{ table_text if table_text else "（空表：没有正闰秒日）" }}</pre>
 </section>
 
 <section class="panel">
-  <h2>替换闰秒表</h2>
+  <h2>手工替换闰秒表（初次核定期间可用）</h2>
   <form method="post" class="stack">
+    <input type="hidden" name="action" value="replace">
     <label for="leap_text">新表内容</label>
     <textarea id="leap_text" name="leap_text" rows="10">{{ table_text }}</textarea>
     <button type="submit">整批校验并替换</button>
@@ -57,7 +170,32 @@
 </section>
 
 <section class="panel">
-  <h2>版本历史</h2>
+  <h2>核定记录</h2>
+  {% if verification_history %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>编号</th><th>时间</th><th>状态</th><th>间隔数</th><th>核定基于版本</th><th>确认启用版本</th></tr></thead>
+      <tbody>
+        {% for item in verification_history %}
+        <tr>
+          <td>#{{ item.id }}</td>
+          <td>{{ item.created_at }}</td>
+          <td>{{ item.status }}</td>
+          <td class="num">{{ item.interval_count }}</td>
+          <td>v{{ item.active_version }}</td>
+          <td>{% if item.confirmed_version %}v{{ item.confirmed_version }}{% else %}—{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">暂无核定记录。</p>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <h2>闰秒表版本历史</h2>
   {% if history %}
   <div class="table-wrap">
     <table>

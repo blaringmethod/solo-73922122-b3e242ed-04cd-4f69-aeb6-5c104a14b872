@@ -38,7 +38,8 @@ from pathlib import Path
 
 from .timecode import (
     DEFAULT_LEAP_TABLE,
-    EPOCH,
+    EARLIEST_DAY,
+    LATEST_DAY,
     LeapTable,
     TimecodeError,
     day_range_real,
@@ -49,13 +50,17 @@ from .timecode import (
     real_to_utc,
     utc_to_real,
 )
+from .verification import (
+    VerificationError,
+    VerificationResult,
+    adjudicate,
+    intervals_to_text,
+)
 
 CSV_FIELDS = ("telescope", "exposure_id", "start", "duration_s")
 MIN_DURATION = 1
 MAX_DURATION = 3600
 MAX_SWAP_REPORT = 500
-EARLIEST_DAY = EPOCH.date()
-LATEST_DAY = _dt.date(9999, 12, 30)
 INTEGER_RE = re.compile(r"^[+-]?\d+$")
 
 
@@ -151,6 +156,19 @@ CREATE TABLE IF NOT EXISTS exposures (
 CREATE INDEX IF NOT EXISTS exposures_start_real ON exposures(start_real);
 CREATE INDEX IF NOT EXISTS exposures_start_real_id ON exposures(start_real, exposure_id);
 CREATE INDEX IF NOT EXISTS exposures_batch ON exposures(batch_id);
+
+CREATE TABLE IF NOT EXISTS verification_runs (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at        TEXT NOT NULL,
+    status            TEXT NOT NULL CHECK (status IN ('no_solution', 'multiple', 'unique', 'confirmed', 'superseded', 'confirm_failed')),
+    candidate_text    TEXT NOT NULL,
+    interval_text     TEXT NOT NULL,
+    interval_count    INTEGER NOT NULL,
+    active_version    INTEGER NOT NULL REFERENCES leap_tables(version),
+    result_json       TEXT NOT NULL,
+    candidate_body    TEXT,
+    confirmed_version INTEGER
+);
 """
 
 
@@ -606,69 +624,192 @@ class Ledger:
             conn = _connect(self.path)
             try:
                 conn.execute("BEGIN IMMEDIATE")
-                old_version, old_table = self._active_table_tx(conn)
+                old_version, _old_table = self._active_table_tx(conn)
+                outcome = self._apply_table_tx(conn, new_table, old_version)
+                conn.execute("COMMIT")
+                return outcome
+            except Exception:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                raise
+            finally:
+                conn.close()
 
-                invalid: list[dict] = []
-                text_updates: list[tuple[int, int, str]] = []
-                for row in conn.execute(
-                    "SELECT exposure_id, telescope, start_raw FROM exposures "
-                    "WHERE start_source = 'utc' ORDER BY exposure_id"
-                ):
-                    try:
-                        parse_utc(row["start_raw"], new_table)
-                        real = utc_to_real(row["start_raw"], new_table)
-                        if real < 0:
-                            raise TimecodeError("stored time is before 2000-01-01")
-                        real_to_utc(real, new_table)  # ensure it is representable
-                    except (TimecodeError, OverflowError) as exc:
-                        invalid.append(
-                            {
-                                "exposure_id": row["exposure_id"],
-                                "telescope": row["telescope"],
-                                "start": row["start_raw"],
-                                "error": str(exc),
-                            }
+    # -- leap adjudication -------------------------------------------------
+
+    @staticmethod
+    def _serialize_result(result: VerificationResult) -> str:
+        payload = {
+            "status": result.status,
+            "candidates": [day.isoformat() for day in result.candidates],
+            "intervals": [
+                {
+                    "start_text": iv.start_text,
+                    "end_text": iv.end_text,
+                    "measured": iv.measured,
+                }
+                for iv in result.intervals
+            ],
+            "fixed_leap_dates": [day.isoformat() for day in result.fixed_leap_dates],
+            "verdicts": [
+                {
+                    "day": v.day.isoformat(),
+                    "determined": v.determined,
+                    "value": v.value,
+                }
+                for v in result.verdicts
+            ],
+            "contradictions": list(result.contradictions),
+            "undetermined": [day.isoformat() for day in result.undetermined],
+            "candidate_body": (
+                format_leap_table(result.candidate_table)
+                if result.candidate_table is not None
+                else None
+            ),
+        }
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+    def run_verification(
+        self, candidate_text: str, interval_text: str
+    ) -> tuple[dict, VerificationResult]:
+        """Run an adjudication against the currently active leap table.
+
+        The submission is solved and recorded (every run is audited); nothing
+        about the active table changes until a later confirmation.
+        """
+
+        with self._write_lock:
+            conn = _connect(self.path)
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                active_version, active_table = self._active_table_tx(conn)
+                result = adjudicate(candidate_text, interval_text, active_table)
+                candidate_body = (
+                    format_leap_table(result.candidate_table)
+                    if result.candidate_table is not None
+                    else None
+                )
+                cursor = conn.execute(
+                    "INSERT INTO verification_runs(created_at, status, candidate_text, "
+                    "interval_text, interval_count, active_version, result_json, "
+                    "candidate_body, confirmed_version) VALUES(?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+                    (
+                        _iso_now(),
+                        result.status,
+                        candidate_text,
+                        intervals_to_text(result.intervals),
+                        len(result.intervals),
+                        active_version,
+                        self._serialize_result(result),
+                        candidate_body,
+                    ),
+                )
+                run_id = int(cursor.lastrowid)
+                conn.execute("COMMIT")
+                return {"run_id": run_id, "active_version": active_version}, result
+            except Exception:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                raise
+            finally:
+                conn.close()
+
+    def confirm_verification(self, run_id: int) -> dict:
+        """Re-check a recorded unique adjudication and activate it if still unique.
+
+        The intervals are re-solved against the *latest committed* exposures
+        and leap table.  Activation happens only when the re-check is still
+        unique and produces exactly the same candidate table as the original
+        run.  Any failure leaves the then-active table in force and day fetches
+        keep using it.
+        """
+
+        with self._write_lock:
+            conn = _connect(self.path)
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT * FROM verification_runs WHERE id = ?", (run_id,)
+                ).fetchone()
+                if row is None:
+                    raise ValidationError(
+                        "confirmation rejected",
+                        [f"verification run #{run_id} does not exist"],
+                    )
+                if row["status"] not in ("unique", "confirm_failed"):
+                    raise ValidationError(
+                        "confirmation rejected",
+                        [
+                            f"run #{run_id} is {row['status']}; only a unique "
+                            "adjudication can be confirmed"
+                        ],
+                    )
+
+                latest_version, latest_table = self._active_table_tx(conn)
+                failure: str | None = None
+                swap: dict | None = None
+                try:
+                    recheck = adjudicate(
+                        row["candidate_text"], row["interval_text"], latest_table
+                    )
+                    if recheck.status != "unique":
+                        failure = (
+                            "re-check against the latest committed data is no longer "
+                            f"unique (status: {recheck.status}); the active table is unchanged"
+                        )
+                    elif row["candidate_body"] != format_leap_table(
+                        recheck.candidate_table
+                    ):
+                        failure = (
+                            "re-check produced a different candidate table than the "
+                            "original adjudication; the active table is unchanged"
                         )
                     else:
-                        text_updates.append((real, 0, row["exposure_id"]))
-                    if len(invalid) >= MAX_SWAP_REPORT:
-                        break
-                if invalid:
-                    raise LeapSwapRejected(invalid)
+                        new_table = parse_leap_table(row["candidate_body"])
+                        swap = self._apply_table_tx(conn, new_table, latest_version)
+                except (VerificationError, TimecodeError) as exc:
+                    failure = f"re-check failed: {exc}; the active table is unchanged"
+                except LeapSwapRejected as exc:
+                    failure = (
+                        "the candidate table would invalidate stored UTC text "
+                        f"({len(exc.offending)} exposure(s)); the active table is unchanged"
+                    )
 
-                if new_table == old_table:
+                if failure is not None:
+                    conn.execute(
+                        "UPDATE verification_runs SET status = 'confirm_failed' WHERE id = ?",
+                        (run_id,),
+                    )
                     conn.execute("COMMIT")
                     return {
-                        "version": old_version,
-                        "previous_version": old_version,
-                        "updated_text_rows": 0,
-                        "unchanged": True,
-                        "leap_days": len(new_table.dates),
+                        "run_id": run_id,
+                        "activated": False,
+                        "active_version": latest_version,
+                        "message": failure,
                     }
 
-                new_version = old_version + 1
+                assert swap is not None
                 conn.execute(
-                    "INSERT INTO leap_tables(version, body, created_at) VALUES(?, ?, ?)",
-                    (new_version, format_leap_table(new_table), _iso_now()),
+                    "UPDATE verification_runs SET status = 'confirmed', "
+                    "confirmed_version = ? WHERE id = ?",
+                    (swap["version"], run_id),
                 )
-                conn.executemany(
-                    "UPDATE exposures SET start_real = ?, leap_version = ? "
-                    "WHERE exposure_id = ?",
-                    [(real, new_version, eid) for real, _old, eid in text_updates],
-                )
-                # Real-second rows keep their absolute instant; their
-                # provenance moves to the active table for future fetches.
+                # Earlier unique runs that were never confirmed are now stale.
                 conn.execute(
-                    "UPDATE exposures SET leap_version = ? WHERE start_source = 'real'",
-                    (new_version,),
+                    "UPDATE verification_runs SET status = 'superseded' "
+                    "WHERE status = 'unique' AND id != ?",
+                    (run_id,),
                 )
                 conn.execute("COMMIT")
                 return {
-                    "version": new_version,
-                    "previous_version": old_version,
-                    "updated_text_rows": len(text_updates),
-                    "unchanged": False,
-                    "leap_days": len(new_table.dates),
+                    "run_id": run_id,
+                    "activated": True,
+                    "active_version": swap["version"],
+                    "previous_version": swap["previous_version"],
+                    "updated_text_rows": swap["updated_text_rows"],
+                    "unchanged": swap["unchanged"],
+                    "leap_days": swap["leap_days"],
+                    "message": "ok",
                 }
             except Exception:
                 if conn.in_transaction:
@@ -676,6 +817,104 @@ class Ledger:
                 raise
             finally:
                 conn.close()
+
+    def verification_history(self, limit: int = 50) -> list[dict]:
+        conn = _connect(self.path)
+        try:
+            rows = conn.execute(
+                "SELECT id, created_at, status, interval_count, active_version, "
+                "candidate_body, confirmed_version FROM verification_runs "
+                "ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            conn.close()
+
+    def get_verification(self, run_id: int) -> dict | None:
+        conn = _connect(self.path)
+        try:
+            row = conn.execute(
+                "SELECT * FROM verification_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            return dict(row) if row is not None else None
+        finally:
+            conn.close()
+
+    def _apply_table_tx(
+        self, conn: sqlite3.Connection, new_table: LeapTable, old_version: int
+    ) -> dict:
+        """Swap in ``new_table`` inside an already-open write transaction.
+
+        Shared by manual replacement and adjudication confirmation.  Raises
+        :class:`LeapSwapRejected` when stored UTC text would become invalid.
+        """
+
+        old_table = parse_leap_table(
+            conn.execute(
+                "SELECT body FROM leap_tables WHERE version = ?", (old_version,)
+            ).fetchone()["body"]
+        )
+        invalid: list[dict] = []
+        text_updates: list[tuple[int, int, str]] = []
+        for row in conn.execute(
+            "SELECT exposure_id, telescope, start_raw FROM exposures "
+            "WHERE start_source = 'utc' ORDER BY exposure_id"
+        ):
+            try:
+                parse_utc(row["start_raw"], new_table)
+                real = utc_to_real(row["start_raw"], new_table)
+                if real < 0:
+                    raise TimecodeError("stored time is before 2000-01-01")
+                real_to_utc(real, new_table)  # ensure it is representable
+            except (TimecodeError, OverflowError) as exc:
+                invalid.append(
+                    {
+                        "exposure_id": row["exposure_id"],
+                        "telescope": row["telescope"],
+                        "start": row["start_raw"],
+                        "error": str(exc),
+                    }
+                )
+            else:
+                text_updates.append((real, 0, row["exposure_id"]))
+            if len(invalid) >= MAX_SWAP_REPORT:
+                break
+        if invalid:
+            raise LeapSwapRejected(invalid)
+
+        if new_table == old_table:
+            return {
+                "version": old_version,
+                "previous_version": old_version,
+                "updated_text_rows": 0,
+                "unchanged": True,
+                "leap_days": len(new_table.dates),
+            }
+
+        new_version = old_version + 1
+        conn.execute(
+            "INSERT INTO leap_tables(version, body, created_at) VALUES(?, ?, ?)",
+            (new_version, format_leap_table(new_table), _iso_now()),
+        )
+        conn.executemany(
+            "UPDATE exposures SET start_real = ?, leap_version = ? "
+            "WHERE exposure_id = ?",
+            [(real, new_version, eid) for real, _old, eid in text_updates],
+        )
+        # Real-second rows keep their absolute instant; their
+        # provenance moves to the active table for future fetches.
+        conn.execute(
+            "UPDATE exposures SET leap_version = ? WHERE start_source = 'real'",
+            (new_version,),
+        )
+        return {
+            "version": new_version,
+            "previous_version": old_version,
+            "updated_text_rows": len(text_updates),
+            "unchanged": False,
+            "leap_days": len(new_table.dates),
+        }
 
 
 def _clip_row(row: sqlite3.Row, day_start: int, day_end: int, table: LeapTable) -> dict:

@@ -29,6 +29,7 @@ from .timecode import (
     format_leap_table,
     parse_date,
 )
+from .verification import VerificationError
 
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 
@@ -74,6 +75,7 @@ def create_app(config: dict | None = None) -> Flask:
     if config:
         app.config.update(config)
     app.ledger = Ledger(app.config["LEDGER_DB"])
+    app.jinja_env.filters["leap_table_text"] = format_leap_table
 
     @app.get("/")
     def index():
@@ -180,6 +182,11 @@ def create_app(config: dict | None = None) -> Flask:
         result = None
         message = None
         if request.method == "POST":
+            action = request.form.get("action", "replace")
+            if action == "adjudicate":
+                return _adjudication_response()
+            if action == "confirm":
+                return _confirmation_response()
             text = request.form.get("leap_text", "")
             try:
                 result = app.ledger.replace_leap_table(text)
@@ -191,6 +198,23 @@ def create_app(config: dict | None = None) -> Flask:
                 offending = [{"error": detail} for detail in exc.details]
             except LedgerError as exc:
                 message = str(exc)
+        return _render_leap(
+            offending=offending, result=result, message=message
+        )
+
+    def _render_leap(
+        offending=None,
+        result=None,
+        message=None,
+        verification=None,
+        verify_error=None,
+        verify_run_id=None,
+        form_candidates="",
+        form_intervals="",
+        confirm_message=None,
+        confirm_ok=None,
+        confirm_outcome=None,
+    ):
         version, table = app.ledger.active_table()
         return render_template(
             "leap.html",
@@ -202,7 +226,79 @@ def create_app(config: dict | None = None) -> Flask:
             offending=offending,
             result=result,
             message=message,
+            verification=verification,
+            verify_error=verify_error,
+            verify_run_id=verify_run_id,
+            form_candidates=form_candidates,
+            form_intervals=form_intervals,
+            confirm_message=confirm_message,
+            confirm_ok=confirm_ok,
+            confirm_outcome=confirm_outcome,
+            verification_history=app.ledger.verification_history(),
             stats=app.ledger.stats(),
+        )
+
+    def _adjudication_response():
+        candidate_text = request.form.get("candidate_text", "")
+        interval_text = request.form.get("interval_text", "")
+        try:
+            meta, verification = app.ledger.run_verification(
+                candidate_text, interval_text
+            )
+        except VerificationError as exc:
+            return _render_leap(
+                verify_error=str(exc),
+                form_candidates=candidate_text,
+                form_intervals=interval_text,
+            )
+        return _render_leap(
+            verification=verification,
+            verify_run_id=meta["run_id"],
+            form_candidates=candidate_text,
+            form_intervals=interval_text,
+        )
+
+    def _confirmation_response():
+        raw_id = request.form.get("run_id", "").strip()
+        candidate_text = request.form.get("candidate_text", "")
+        interval_text = request.form.get("interval_text", "")
+        if not raw_id.isdigit():
+            return _render_leap(
+                confirm_message="确认失败：缺少有效的核定编号。",
+                confirm_ok=False,
+                form_candidates=candidate_text,
+                form_intervals=interval_text,
+            )
+        try:
+            outcome = app.ledger.confirm_verification(int(raw_id))
+        except ValidationError as exc:
+            return _render_leap(
+                confirm_message="；".join(exc.details) or str(exc),
+                confirm_ok=False,
+                form_candidates=candidate_text,
+                form_intervals=interval_text,
+            )
+        return _render_leap(
+            confirm_message=outcome["message"],
+            confirm_ok=outcome["activated"],
+            confirm_outcome=outcome,
+            form_candidates=candidate_text,
+            form_intervals=interval_text,
+        )
+
+    @app.get("/interval_template.csv")
+    def interval_template_csv():
+        sample = (
+            "start_utc,end_utc,measured_seconds\n"
+            "2020-12-31 00:00:00,2021-01-01 00:00:00,86401\n"
+            "2020-12-31 23:59:59,2021-01-01 00:00:00,2\n"
+        )
+        return Response(
+            sample,
+            mimetype="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": 'attachment; filename="pulse_interval_template.csv"'
+            },
         )
 
     @app.errorhandler(413)

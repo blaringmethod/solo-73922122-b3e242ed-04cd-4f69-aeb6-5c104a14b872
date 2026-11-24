@@ -131,6 +131,16 @@ button:hover, .button:hover { background: #4680f2; }
   border-radius: 10px;
   padding: 12px 14px;
 }
+.warnbox {
+  margin-top: 14px;
+  border: 1px solid #6b5520;
+  background: #241d10;
+  border-radius: 10px;
+  padding: 12px 14px;
+}
+.leap-yes { color: var(--ok); font-weight: 600; }
+.leap-no { color: var(--muted); }
+.leap-unknown { color: var(--warn); font-weight: 600; }
 
 .facts {
   display: grid;

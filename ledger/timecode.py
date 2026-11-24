@@ -21,6 +21,9 @@ from dataclasses import dataclass
 EPOCH = _dt.datetime(2000, 1, 1, 0, 0, 0)
 EPOCH_DATE = EPOCH.date()
 DAY = 86400
+#: Earliest and latest civil day the ledger represents.
+EARLIEST_DAY = EPOCH_DATE
+LATEST_DAY = _dt.date(9999, 12, 30)
 UTC_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
